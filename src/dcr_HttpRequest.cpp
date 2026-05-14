@@ -2,8 +2,8 @@
 
 #include "dcr_HttpConnectionPool.h"
 
-#include <dcr_FreeRtosRaii.h>
-#include <dcr_MutexRegistry.h>
+#include <dcr_taskManager/FreeRtosRaii.h>
+#include <dcr_taskManager/MutexRegistry.h>
 #include <dcr_Logger.h>
 #include <dcr_NetLink.h>
 #include <esp_heap_caps.h>
