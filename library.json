@@ -10,11 +10,7 @@
     "email": "me@williamgiles.co.nz",
     "url": "https://github.com/DCRalph"
   },
-  "dependencies": {
-    "dcr_logger": "https://github.com/dcralph/dcr_logger.git",
-    "dcr_rtos_utils": "https://github.com/dcralph/dcr_rtos_utils.git",
-    "dcr_net_link": "https://github.com/dcralph/dcr_net_link.git"
-  },
+  "dependencies": {},
   "build": {
     "srcDir": ".",
     "includeDir": ".",

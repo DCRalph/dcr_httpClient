@@ -2,8 +2,8 @@
 
 #include "httpClient/HttpConnectionPool.h"
 
-#include <rtosUtils/FreeRtosRaii.h>
-#include <rtosUtils/MutexRegistry.h>
+#include <taskManager/FreeRtosRaii.h>
+#include <taskManager/MutexRegistry.h>
 #include <logger/Logger.h>
 #include <netLink/NetLink.h>
 #include <esp_heap_caps.h>

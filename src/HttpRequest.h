@@ -11,7 +11,7 @@
 //  All public functions are thread-safe.
 //
 
-#include <rtosUtils/FreeRtosRaii.h>
+#include <taskManager/FreeRtosRaii.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
