@@ -12,8 +12,6 @@
   },
   "dependencies": {},
   "build": {
-    "srcDir": ".",
-    "includeDir": ".",
     "unflags": ["-std=gnu++11", "-std=gnu++14"],
     "flags": ["-std=gnu++17"]
   }
