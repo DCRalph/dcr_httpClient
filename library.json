@@ -1,0 +1,24 @@
+{
+  "name": "dcr_http_client",
+  "version": "1.0.0",
+  "description": "ESP32 Arduino HTTP client and connection pool.",
+  "keywords": "esp32, arduino, http, https, connection-pool",
+  "frameworks": "arduino",
+  "platforms": ["espressif32"],
+  "authors": {
+    "name": "William Giles",
+    "email": "me@williamgiles.co.nz",
+    "url": "https://github.com/DCRalph"
+  },
+  "dependencies": {
+    "dcr_logger": "https://github.com/dcralph/dcr_logger.git",
+    "dcr_rtos_utils": "https://github.com/dcralph/dcr_rtos_utils.git",
+    "dcr_net_link": "https://github.com/dcralph/dcr_net_link.git"
+  },
+  "build": {
+    "srcDir": ".",
+    "includeDir": ".",
+    "unflags": ["-std=gnu++11", "-std=gnu++14"],
+    "flags": ["-std=gnu++17"]
+  }
+}
