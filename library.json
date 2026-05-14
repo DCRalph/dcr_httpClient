@@ -1,6 +1,7 @@
 {
   "name": "dcr_http_client",
   "version": "1.0.0",
+  "license": "AGPL-3.0",
   "description": "ESP32 Arduino HTTP client and connection pool.",
   "keywords": "esp32, arduino, http, https, connection-pool",
   "frameworks": "arduino",
