@@ -1,11 +1,11 @@
-#include "httpClient/HttpRequest.h"
+#include "dcr_HttpRequest.h"
 
-#include "httpClient/HttpConnectionPool.h"
+#include "dcr_HttpConnectionPool.h"
 
-#include <taskManager/FreeRtosRaii.h>
-#include <taskManager/MutexRegistry.h>
-#include <logger/Logger.h>
-#include <netLink/NetLink.h>
+#include <dcr_FreeRtosRaii.h>
+#include <dcr_MutexRegistry.h>
+#include <dcr_Logger.h>
+#include <dcr_NetLink.h>
 #include <esp_heap_caps.h>
 #include <ESP.h>
 

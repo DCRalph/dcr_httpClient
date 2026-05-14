@@ -19,7 +19,7 @@
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
-#include <netLink/INetLink.h>
+#include <dcr_INetLink.h>
 #include <cstdint>
 
 namespace HTTP

@@ -1,6 +1,6 @@
-#include "httpClient/HttpConnectionPool.h"
-#include "httpClient/HttpRequest.h"
-#include <logger/Logger.h>
+#include "dcr_HttpConnectionPool.h"
+#include "dcr_HttpRequest.h"
+#include <dcr_Logger.h>
 #include <WiFi.h>
 #include <lwip/sockets.h>
 
