@@ -44,32 +44,65 @@ namespace HTTP
 
   void ConnectionPool::teardown(bool linkSuspect)
   {
-    // Order matters: clear the sslclient socket field FIRST, before any
-    // _http->end() that could itself drive _client->stop()->close(fd).
+    // A link disconnect since this client was set up means the cached lwip
+    // socket fd may already have been freed and recycled to another VFS
+    // driver (e.g. LittleFS). Treat the fd as suspect on those paths too, so
+    // callers that do NOT pass linkSuspect explicitly -- invalidate() and the
+    // destructor -- are still protected. (Previously invalidate() relied
+    // solely on the isLwipSocket() heuristic, which is unreliable: see below.)
+    const uint32_t curSeq = _netLink ? _netLink->disconnectEventSeq() : 0;
+    if (_secureClient && curSeq != _lastSeenDisconnectSeq)
+      linkSuspect = true;
+
+    // NEVER let WiFiClientSecure drive the VFS close() on the cached fd.
+    //
+    // WiFiClientSecure::stop() calls close(fd), which is VFS-routed. If `fd`
+    // was recycled from a dead lwip socket to a LittleFS file, close(fd)
+    // dispatches into vfs_littlefs_close() with no open file and trips
+    //   assert failed: lfs_file_close ... lfs_mlist_isopen(...)   -> panic.
+    //
+    // The old guard tried to detect this with isLwipSocket() (lwip_getsockopt),
+    // but that checks lwip's INTERNAL socket table, not whether the GLOBAL VFS
+    // fd still routes to the socket driver. After fd recycling the two
+    // namespaces diverge, so the check returns false positives and stop() ran
+    // close() on a fd that now belonged to LittleFS -> the crash.
+    //
+    // Instead: (1) snapshot the fd, (2) neutralise sslclient->socket to -1 via
+    // the socket() side-effect accessor BEFORE any _http->end(),
+    // _secureClient->stop() or ~WiFiClientSecure() can run -- this makes the
+    // VFS close() impossible -- then (3) close the real socket ourselves with
+    // lwip_close(), the lwip-namespace close that can NEVER dispatch into the
+    // LittleFS VFS. We only issue the explicit close when the link is not
+    // suspect and the fd still looks like a live socket; on the suspect path
+    // we skip it (the socket was almost certainly already torn down by the
+    // stack), trading a rare, recoverable socket leak for guaranteed
+    // crash-safety.
     if (_secureClient)
     {
       const int fd = _secureClient->fd();
-      const bool fdIsSuspect = linkSuspect || (fd >= 0 && !isLwipSocket(fd));
+      (void)_secureClient->socket(); // intentional side-effect: assign -1
 
-      if (fdIsSuspect)
+      if (!linkSuspect && fd >= 0 && isLwipSocket(fd))
       {
-        debugW("teardown: fd %d suspect (linkSuspect=%d); skipping close()",
+        lwip_close(fd); // lwip namespace: cannot dispatch into LittleFS
+      }
+      else if (fd >= 0)
+      {
+        debugW("teardown: not closing fd %d via close() (linkSuspect=%d)",
                fd, static_cast<int>(linkSuspect));
-        (void)_secureClient->socket(); // intentional side-effect: assign -1
       }
     }
 
     if (_http)
     {
-      _http->end();
+      _http->end(); // safe: underlying client's fd is already -1
       delete _http;
       _http = nullptr;
     }
 
     if (_secureClient)
     {
-      if (!linkSuspect && _secureClient->fd() >= 0)
-        _secureClient->stop();
+      // fd already -1: stop()/dtor frees the mbedTLS context only, no close().
       delete _secureClient;
       _secureClient = nullptr;
     }
