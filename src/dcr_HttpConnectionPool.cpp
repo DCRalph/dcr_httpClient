@@ -102,7 +102,19 @@ namespace HTTP
 
     if (_secureClient)
     {
-      // fd already -1: stop()/dtor frees the mbedTLS context only, no close().
+      // Re-neutralise the socket fd to -1 IMMEDIATELY before destruction.
+      // The socket() call near the top of teardown() already set it to -1,
+      // but _http->end() and ~HTTPClient run in between and can leave a
+      // (recycled) fd in the sslclient context again. ~WiFiClientSecure ->
+      // stop() issues the VFS-routed close() on any fd >= 0; if that fd was
+      // recycled from a freed socket to a LittleFS file, close() dispatches
+      // into vfs_littlefs_close() -> lfs_file_close() and trips
+      //   assert failed: lfs_file_close ... lfs_mlist_isopen(...)  -> panic.
+      // Forcing -1 here, with nothing running before delete, makes stop()'s
+      // close() an unconditional no-op. The real socket, when live and the
+      // link is healthy, was already closed via lwip_close() in the guard
+      // above (lwip namespace, can never dispatch into LittleFS).
+      (void)_secureClient->socket(); // intentional side-effect: assign -1
       delete _secureClient;
       _secureClient = nullptr;
     }
