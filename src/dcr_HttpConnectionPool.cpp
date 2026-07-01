@@ -160,7 +160,11 @@ namespace HTTP
       // server's root CA to enable proper TLS verification.
       _secureClient->setInsecure();
       _secureClient->setHandshakeTimeout(30);
-      _lastSeenDisconnectSeq = curSeq; // baseline for this fresh client
+      // FIX: baseline from a FRESH read, not the stale curSeq snapshot taken at
+      // the top of acquireClient(). If a disconnect fired during this call, curSeq
+      // is already outdated and would make the next acquire tear down this
+      // brand-new client needlessly (extra handshake during WiFi instability).
+      _lastSeenDisconnectSeq = _netLink ? _netLink->disconnectEventSeq() : 0;
 
       debugD("Allocated new WiFiClientSecure");
     }
@@ -173,9 +177,16 @@ namespace HTTP
     if (WiFi.status() != WL_CONNECTED)
       return nullptr;
 
-    if (_http && (!_secureClient || !_secureClient->connected()))
-      teardown();
-
+    // FIX(use-after-free): acquireHttp() must NOT probe _secureClient->connected()
+    // or tear the pool down. Connection validity + teardown are owned entirely by
+    // acquireClient(), which the caller invokes FIRST. Previously this re-probed
+    // connected() and, if a keep-alive FIN landed between the two acquire calls,
+    // ran teardown() -- freeing the very WiFiClientSecure the caller had already
+    // taken from acquireClient() -- leaving that pointer dangling for the
+    // subsequent http->begin(*client)/client->connected() (heap corruption/panic).
+    // Since teardown() always frees _http together with _secureClient, whenever
+    // acquireClient() rebuilds the client it leaves _http == nullptr, so a fresh
+    // HTTPClient is allocated here anyway; no second connectivity check is needed.
     if (!_http)
     {
       _http = new HTTPClient();
@@ -232,7 +243,17 @@ namespace HTTP
 
   bool ConnectionPool::isConnected() const
   {
-    return _secureClient && _secureClient->connected();
+    if (!_secureClient)
+      return false;
+    // FIX: do NOT probe connected() when the link dropped since this client was
+    // set up -- connected() can drive stop()->close() on a fd that may have been
+    // recycled to a LittleFS file (the lfs_file_close panic class). Being const,
+    // this accessor cannot perform the safe teardown, so it reports "not
+    // connected" on a seq advance; the next acquireClient() tears down safely.
+    const uint32_t curSeq = _netLink ? _netLink->disconnectEventSeq() : 0;
+    if (curSeq != _lastSeenDisconnectSeq)
+      return false;
+    return _secureClient->connected();
   }
 
 } // namespace HTTP
