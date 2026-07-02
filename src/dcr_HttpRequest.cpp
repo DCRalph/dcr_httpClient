@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <utility>
 
 #undef LOG_TAG
 #define LOG_TAG "HTTP"
@@ -911,11 +912,19 @@ namespace HTTP
 
   // ── Convenience wrappers ───────────────────────────────────
   //
-  // BUG FIX: Lambda captures for `post()` and `put()` now take a copy
-  // of the payload String rather than capturing by reference. The
-  // original code captured `const String &payload` by reference; if the
-  // caller's String went out of scope or was modified before the lambda
-  // executed inside the WiFi request path, the reference would dangle.
+  // BUG FIX: Lambda captures for `post()` and `put()` own a copy of the
+  // payload String rather than capturing by reference, so the closure can
+  // never dangle if the caller's String goes out of scope or is modified
+  // before the lambda executes inside the WiFi request path.
+  //
+  // RAM FIX: exactly ONE owned copy, moved into the closure. The previous
+  // code held ~4 simultaneous copies of the body at peak: payloadCopy, the
+  // by-value lambda capture, and HTTPClient::POST(String)'s by-value
+  // parameter, on top of the caller's original. Sending via the
+  // POST/PUT(uint8_t*, size_t) overloads transmits straight from the owned
+  // copy with no further duplication. orchestrateRequest's requestBody
+  // parameter is a const& used only for logging and binds to the caller's
+  // payload, which outlives the fully-synchronous request.
   //
 
   HttpResponse get(const String &url, const String &headers,
@@ -939,15 +948,14 @@ namespace HTTP
       allH += headers;
     }
 
-    // Capture payload by value to avoid dangling reference.
-    const String payloadCopy = payload;
+    String payloadCopy = payload;
     return orchestrateRequest(
         "POST", url,
-        [payloadCopy](HTTPClient *c)
+        [body = std::move(payloadCopy)](HTTPClient *c)
         {
-          return c ? c->POST(payloadCopy) : -1;
+          return c ? c->POST((uint8_t *)body.c_str(), body.length()) : -1;
         },
-        timeoutMs, payloadCopy, logErrors, allH);
+        timeoutMs, payload, logErrors, allH);
   }
 
   HttpResponse postBinary(const String &url, const uint8_t *data,
@@ -984,14 +992,14 @@ namespace HTTP
       allH += headers;
     }
 
-    const String payloadCopy = payload;
+    String payloadCopy = payload;
     return orchestrateRequest(
         "PUT", url,
-        [payloadCopy](HTTPClient *c)
+        [body = std::move(payloadCopy)](HTTPClient *c)
         {
-          return c ? c->PUT(payloadCopy) : -1;
+          return c ? c->PUT((uint8_t *)body.c_str(), body.length()) : -1;
         },
-        timeoutMs, payloadCopy, logErrors, allH);
+        timeoutMs, payload, logErrors, allH);
   }
 
   HttpResponse del(const String &url, const String &headers,
