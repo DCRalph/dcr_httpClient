@@ -26,10 +26,6 @@ namespace
 {
   using CompletionSignal = FreeRtosRaii::BinarySemaphore;
 
-  // Returns true if fd is currently a live lwip socket. Uses lwip_getsockopt
-  // (NOT VFS getsockopt) so it never dispatches into LittleFS on a recycled fd.
-  // Mirrors the helper in dcr_HttpConnectionPool.cpp; used to close one-shot TLS
-  // sockets in the lwip namespace instead of via the VFS close() path.
   bool isLwipSocket(int fd)
   {
     if (fd < 0)
@@ -195,10 +191,6 @@ namespace
     if (auto lock = FreeRtosRaii::tryLock(HTTP::httpHeadersMutex(), MUTEX_WAIT_SHORT))
       merged = HTTP::s_persistentHeaders;
     else
-      // FIX(visibility): the headers mutex is only ever held briefly (never
-      // across I/O), so a timeout is near-impossible; if it ever happens the
-      // request would go out WITHOUT persistent headers (e.g. an auth token) --
-      // surface it instead of silently dropping them.
       debugW("buildMergedHeaders: headers mutex busy; request omits persistent headers");
 
     parseHeaderLines(additionalHeaders, merged);
@@ -284,9 +276,6 @@ namespace
       const uint32_t elapsed = nowMs - entry.lastLoggedMs;
       if (elapsed < HTTP_FAILURE_DEDUPE_WINDOW_MS)
       {
-        // BUG FIX: Do NOT update lastLoggedMs here. The original code
-        // caused the dedup window to slide forward indefinitely,
-        // suppressing all repeat failures after the first one.
         return false;
       }
 
@@ -514,8 +503,6 @@ namespace
       return response;
     }
 
-    // FIX(16-bit truncation): HTTPClient::setTimeout() takes uint16_t, so values
-    // >65535 wrap (e.g. 90000 ms -> 24464 ms). Saturate rather than wrap.
     http->setTimeout(timeoutMs > 65535 ? (uint16_t)65535 : (uint16_t)timeoutMs);
 
     trace.failureStage = "http-begin";
@@ -556,9 +543,6 @@ namespace
     }
     else
     {
-      // FIX(classification): include HTTPClient's error text so
-      // classifyFailureCategory() can distinguish dns/timeout/transport rather
-      // than collapsing every negative status into one dedup signature.
       response.error = "HTTP error code: " + String(response.statusCode) +
                        " (" + HTTPClient::errorToString(response.statusCode) + ")";
       // Negative status means transport failure; tear down so next
@@ -575,15 +559,6 @@ namespace
     debugV("Pooled request %s %s | begin: %lums | request: %lums",
            method, url.c_str(), trace.beginMs, trace.requestMs);
 
-    // FIX(false failure on keep-alive close): a server legitimately closing the
-    // HTTP/1.1 keep-alive socket AFTER sending a complete response (Connection:
-    // close, keepalive cap, proxy rotation) is normal, not a failure. After a
-    // full read available()==0 so connected() goes false either way; only treat
-    // it as an error when the body was actually TRUNCATED (fewer bytes than the
-    // advertised Content-Length). Otherwise keep success and just recycle the
-    // now-closed pooled connection so the next request reconnects -- previously
-    // this failed valid 2xx responses, causing spurious retries / duplicate
-    // datapoints whenever the server rotated the connection.
     if (response.success && !invalidated && !client->connected())
     {
       const int contentLen = http->getSize(); // -1 when close-delimited/unknown
@@ -623,10 +598,7 @@ namespace
     HTTPClient http;
 
     http.setUserAgent(HTTP::userAgent());
-    // FIX(16-bit truncation): saturate rather than wrap (setTimeout is uint16_t).
     http.setTimeout(timeoutMs > 65535 ? (uint16_t)65535 : (uint16_t)timeoutMs);
-    // FIX(unbounded connect): bound the TCP connect by the caller's timeout
-    // instead of the 5 s default so a stuck connect cannot pin the request mutex.
     http.setConnectTimeout(timeoutMs);
 
     const bool https = HTTP::isHttpsUrl(url);
@@ -640,10 +612,6 @@ namespace
     if (https)
     {
       httpsClient.setInsecure();
-      // FIX(unbounded handshake): WiFiClientSecure defaults to a 120 s handshake
-      // timeout; bound it by the caller's timeout (matching the pooled path's
-      // 30 s cap) so a stalled TLS handshake cannot hold the request mutex for
-      // two minutes and starve every other HTTP caller.
       const uint32_t handshakeSecs =
           timeoutMs > 0 ? (uint32_t)((timeoutMs + 999) / 1000) : 30;
       httpsClient.setHandshakeTimeout(handshakeSecs);
@@ -686,7 +654,6 @@ namespace
     }
     else
     {
-      // FIX(classification): include HTTPClient error text (see pooled path).
       response.error = "HTTP error code: " + String(response.statusCode) +
                        " (" + HTTPClient::errorToString(response.statusCode) + ")";
     }
@@ -699,14 +666,6 @@ namespace
     debugV("WiFi stages for %s %s | begin: %lums | request: %lums",
            method, url.c_str(), trace.beginMs, trace.requestMs);
 
-    // FIX(LittleFS-close crash class): before http.end()/~WiFiClientSecure run
-    // their VFS-routed close(fd) on this one-shot TLS client, neutralise the
-    // socket fd the way ConnectionPool::teardown does. If a WiFi drop recycled
-    // the fd to a LittleFS file, a VFS close() would dispatch into
-    // vfs_littlefs_close() -> lfs_file_close assert -> panic. Snapshot the fd,
-    // force the sslclient socket to -1 (so close() becomes a no-op), run end(),
-    // then close the real socket via lwip_close (lwip namespace, never dispatches
-    // into LittleFS) when it still looks like a live socket.
     if (https)
     {
       const int fd = httpsClient.fd();
@@ -910,23 +869,6 @@ namespace HTTP
     applyHeadersToClient(client, headers);
   }
 
-  // ── Convenience wrappers ───────────────────────────────────
-  //
-  // BUG FIX: Lambda captures for `post()` and `put()` own a copy of the
-  // payload String rather than capturing by reference, so the closure can
-  // never dangle if the caller's String goes out of scope or is modified
-  // before the lambda executes inside the WiFi request path.
-  //
-  // RAM FIX: exactly ONE owned copy, moved into the closure. The previous
-  // code held ~4 simultaneous copies of the body at peak: payloadCopy, the
-  // by-value lambda capture, and HTTPClient::POST(String)'s by-value
-  // parameter, on top of the caller's original. Sending via the
-  // POST/PUT(uint8_t*, size_t) overloads transmits straight from the owned
-  // copy with no further duplication. orchestrateRequest's requestBody
-  // parameter is a const& used only for logging and binds to the caller's
-  // payload, which outlives the fully-synchronous request.
-  //
-
   HttpResponse get(const String &url, const String &headers,
                    int timeoutMs, bool logErrors)
   {
@@ -1050,9 +992,6 @@ namespace HTTP
       }
       else
       {
-        // FIX: percent-encode space as %20 (RFC 3986) instead of '+'. '+' only
-        // decodes to space in x-www-form-urlencoded query bodies; in a URL path
-        // (or any value the server percent-decodes) '+' is a literal plus.
         const auto hi = static_cast<uint8_t>(c) >> 4;
         const auto lo = static_cast<uint8_t>(c) & 0x0Fu;
         out += '%';
