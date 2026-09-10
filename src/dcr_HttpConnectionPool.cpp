@@ -42,11 +42,19 @@ namespace HTTP
     debugI("HTTP connection pool initialised");
   }
 
+  // WiFi.status() stays WL_CONNECTED after an AUTH_EXPIRE deauth; the link
+  // monitor tracks GOT_IP / STA_DISCONNECTED.
+  static bool linkUp(const INetLink *netLink)
+  {
+    return netLink ? netLink->isConnected() : (WiFi.status() == WL_CONNECTED);
+  }
+
   void ConnectionPool::teardown(bool linkSuspect)
   {
     const uint32_t curSeq = _netLink ? _netLink->disconnectEventSeq() : 0;
     if (_secureClient && curSeq != _lastSeenDisconnectSeq)
       linkSuspect = true;
+    _keepaliveFd = -1;
 
     if (_secureClient)
     {
@@ -84,7 +92,7 @@ namespace HTTP
 
   WiFiClientSecure *ConnectionPool::acquireClient()
   {
-    if (WiFi.status() != WL_CONNECTED)
+    if (!linkUp(_netLink))
       return nullptr;
 
     // If WiFi disconnected since this client was set up, the cached lwip
@@ -129,7 +137,7 @@ namespace HTTP
 
   HTTPClient *ConnectionPool::acquireHttp()
   {
-    if (WiFi.status() != WL_CONNECTED)
+    if (!linkUp(_netLink))
       return nullptr;
 
     if (!_http)
@@ -153,6 +161,21 @@ namespace HTTP
   void ConnectionPool::markUsed()
   {
     _lastUsedMs = millis();
+
+    if (!_secureClient)
+      return;
+    const int fd = _secureClient->fd();
+    if (fd < 0 || fd == _keepaliveFd || !isLwipSocket(fd))
+      return;
+
+    // Probes refresh NAT mappings and surface a dead peer within a minute.
+    // lwip takes TCP_KEEPIDLE / TCP_KEEPINTVL in seconds.
+    int on = 1, idleS = 30, intervalS = 10, count = 3;
+    lwip_setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    lwip_setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idleS, sizeof(idleS));
+    lwip_setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intervalS, sizeof(intervalS));
+    lwip_setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+    _keepaliveFd = fd;
   }
 
   void ConnectionPool::invalidate()

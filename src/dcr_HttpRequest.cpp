@@ -88,6 +88,7 @@ namespace HTTP
 
   static String s_serverEndpoint;
   static DeviceIdentityProvider s_deviceIdentityProvider;
+  static ServerTimeSink s_serverTimeSink;
 
   FreeRtosRaii::Mutex &requestMutex() { return httpRequestMutex(); }
   void setUserAgent(const String &userAgent) { s_userAgent = userAgent; }
@@ -95,6 +96,7 @@ namespace HTTP
   void setFailureLogger(FailureLogger logger) { s_failureLogger = std::move(logger); }
   void setServerEndpoint(const String &baseUrl) { s_serverEndpoint = baseUrl; }
   void setDeviceIdentityProvider(DeviceIdentityProvider provider) { s_deviceIdentityProvider = std::move(provider); }
+  void setServerTimeSink(ServerTimeSink sink) { s_serverTimeSink = std::move(sink); }
 } // namespace HTTP
 
 // ═══════════════════════════════════════════════════════════════════
@@ -447,9 +449,55 @@ namespace
                           LoggerInternal::GetLatestLogs());
   }
 
+  // WiFi.status() stays WL_CONNECTED after an AUTH_EXPIRE deauth; NetLink
+  // tracks GOT_IP / STA_DISCONNECTED and is the only reliable link signal.
   bool isWiFiAvailable()
   {
-    return WiFi.status() == WL_CONNECTED;
+    return netLink.isConnected();
+  }
+
+  // RFC 7231 IMF-fixdate, e.g. "Tue, 09 Sep 2026 23:12:07 GMT". UTC by definition.
+  bool parseHttpDate(const String &value, uint32_t &epoch)
+  {
+    char mon[4] = {0};
+    int day = 0, year = 0, hour = 0, min = 0, sec = 0;
+    if (sscanf(value.c_str(), "%*3s, %d %3s %d %d:%d:%d",
+               &day, mon, &year, &hour, &min, &sec) != 6)
+      return false;
+
+    static const char *const kMonths = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    const char *p = strstr(kMonths, mon);
+    if (!p || (p - kMonths) % 3 != 0 || year < 2024)
+      return false;
+    const int month = static_cast<int>(p - kMonths) / 3 + 1;
+
+    // Days from civil (Hinnant), proleptic Gregorian.
+    const int y = year - (month <= 2 ? 1 : 0);
+    const int era = y / 400;
+    const int yoe = y - era * 400;
+    const int doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    const int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const int64_t days = static_cast<int64_t>(era) * 146097 + doe - 719468;
+    epoch = static_cast<uint32_t>(days * 86400 + hour * 3600 + min * 60 + sec);
+    return true;
+  }
+
+  // Failures worth one retry on a fresh socket when the request went out on a
+  // reused keep-alive connection. Send failures never reached the server, so
+  // any method is safe; a silent read timeout may have, so only GET/HEAD.
+  bool retriableOnFreshConnection(const char *method, int code)
+  {
+    switch (code)
+    {
+    case HTTPC_ERROR_SEND_HEADER_FAILED:
+    case HTTPC_ERROR_SEND_PAYLOAD_FAILED:
+      return true;
+    case HTTPC_ERROR_CONNECTION_LOST:
+    case HTTPC_ERROR_READ_TIMEOUT:
+      return strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0;
+    default:
+      return false;
+    }
   }
 
 } // anonymous namespace
@@ -481,9 +529,9 @@ namespace
     return !HTTP::s_serverEndpoint.isEmpty() && url.startsWith(HTTP::s_serverEndpoint);
   }
 
-  /// Execute an HTTP request using the persistent connection pool.
+  /// One attempt over the persistent connection pool.
   /// The caller must hold HTTP::httpRequestMutex().
-  HTTP::HttpResponse executePooledRequest(
+  HTTP::HttpResponse executePooledAttempt(
       const char *method,
       const String &url,
       std::function<int(HTTPClient *)> requestFn,
@@ -503,7 +551,16 @@ namespace
       return response;
     }
 
+    static const char *kCollectHeaders[] = {"Date"};
+    http->collectHeaders(kCollectHeaders, 1);
+
     http->setTimeout(timeoutMs > 65535 ? (uint16_t)65535 : (uint16_t)timeoutMs);
+    // setTimeout bounds reads only. Without these the caller's budget does not
+    // cover DNS, connect or handshake, so a 10 s request can block for 30 s+.
+    // The pool caches the client, so the handshake timeout is set per request
+    // rather than once at allocation.
+    http->setConnectTimeout(timeoutMs);
+    client->setHandshakeTimeout(timeoutMs > 0 ? (uint32_t)((timeoutMs + 999) / 1000) : 30);
 
     trace.failureStage = "http-begin";
     const unsigned long t0 = millis();
@@ -539,6 +596,13 @@ namespace
       else
       {
         trace.failureStage = "completed";
+      }
+
+      if (HTTP::s_serverTimeSink)
+      {
+        uint32_t epoch = 0;
+        if (parseHttpDate(http->header("Date"), epoch))
+          HTTP::s_serverTimeSink(epoch);
       }
     }
     else
@@ -580,6 +644,33 @@ namespace
     if (!invalidated)
       http->end();
 
+    return response;
+  }
+
+  /// Pooled request with one retry on a fresh socket. A reused keep-alive
+  /// connection can be dead without the client knowing (NAT mapping expired,
+  /// peer FIN without close_notify); the first send on it fails or times out.
+  HTTP::HttpResponse executePooledRequest(
+      const char *method,
+      const String &url,
+      std::function<int(HTTPClient *)> requestFn,
+      int timeoutMs,
+      const String &requestBody,
+      const std::vector<String> &headers,
+      WiFiRequestTrace &trace)
+  {
+    HTTP::HttpResponse response;
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+      const bool reused = HTTP::connectionPool.isConnected();
+      response = executePooledAttempt(method, url, requestFn, timeoutMs,
+                                      requestBody, headers, trace);
+      if (response.statusCode > 0 || !reused ||
+          !retriableOnFreshConnection(method, response.statusCode))
+        break;
+      debugW("%s %s failed on a reused connection (%d); retrying on a fresh one",
+             method, url.c_str(), response.statusCode);
+    }
     return response;
   }
 

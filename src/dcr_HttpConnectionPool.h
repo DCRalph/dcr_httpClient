@@ -11,10 +11,9 @@
 //  Thread safety: all access is serialised through Mutex::httpRequest
 //  (the same mutex already used in httpRequest.cpp).
 //
-//  Cloudflare's client-side keep-alive window is 400 seconds. If the
-//  connection has been idle longer than IDLE_RECYCLE_MS, the pool
-//  proactively tears it down so the next request gets a clean
-//  handshake rather than discovering a reset mid-flight.
+//  An idle socket is recycled after IDLE_RECYCLE_MS and kept alive with TCP
+//  keepalive probes in between, because consumer NATs and phone hotspots drop
+//  idle TCP mappings long before Cloudflare's 400 s keep-alive window.
 //
 
 #include <HTTPClient.h>
@@ -83,10 +82,13 @@ namespace HTTP
     // to close().
     uint32_t _lastSeenDisconnectSeq = 0;
 
-    // Recycle the connection if idle for longer than this.
-    // Cloudflare closes client connections after 400 s of inactivity;
-    // we recycle at 350 s to avoid hitting a reset.
-    static constexpr uint32_t IDLE_RECYCLE_MS = 350u * 1000u;
+    // Socket fd that already has keepalive options applied.
+    int _keepaliveFd = -1;
+
+    // Recycle the connection if idle for longer than this. Consumer NATs and
+    // phone hotspots expire idle TCP mappings in 60-300 s; a fresh handshake
+    // costs ~1 s, a stale socket costs a 10 s timeout and a failed job.
+    static constexpr uint32_t IDLE_RECYCLE_MS = 45u * 1000u;
   };
 
   /// Global singleton. Defined in HttpConnectionPool.cpp.

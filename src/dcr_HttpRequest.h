@@ -70,6 +70,11 @@ namespace HTTP
   using DeviceIdentityProvider = std::function<void(std::vector<String> &headers)>;
   void setDeviceIdentityProvider(DeviceIdentityProvider provider);
 
+  /// Receives the Unix epoch from the Date header of every successful pooled
+  /// (API host) response. Lets the application keep a clock without NTP.
+  using ServerTimeSink = std::function<void(uint32_t epoch)>;
+  void setServerTimeSink(ServerTimeSink sink);
+
   // ─── Request API ───────────────────────────────────────────
   //
   // Each function blocks until the request completes (or times out).
