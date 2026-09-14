@@ -7,7 +7,7 @@
 #include <dcr_Logger.h>
 #include <dcr_NetLink.h>
 #include <esp_heap_caps.h>
-#include <ESP.h>
+#include <Esp.h>
 #include <lwip/sockets.h>
 
 #include <algorithm>
