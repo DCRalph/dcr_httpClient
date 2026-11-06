@@ -28,7 +28,7 @@ namespace HTTP
 
   ConnectionPool::~ConnectionPool()
   {
-    teardown(/*linkSuspect=*/true);
+    teardown(TeardownReason::Shutdown);
   }
 
   void ConnectionPool::init(INetLink *netLinkMonitor)
@@ -49,8 +49,9 @@ namespace HTTP
     return netLink ? netLink->isConnected() : (WiFi.status() == WL_CONNECTED);
   }
 
-  void ConnectionPool::teardown(bool linkSuspect)
+  void ConnectionPool::teardown(TeardownReason reason)
   {
+    bool linkSuspect = reason == TeardownReason::LinkDrop || reason == TeardownReason::Shutdown;
     const uint32_t curSeq = _netLink ? _netLink->disconnectEventSeq() : 0;
     if (_secureClient && curSeq != _lastSeenDisconnectSeq)
       linkSuspect = true;
@@ -58,6 +59,24 @@ namespace HTTP
 
     if (_secureClient)
     {
+      switch (reason)
+      {
+      case TeardownReason::Invalidate:
+        _stats.invalidations++;
+        break;
+      case TeardownReason::Idle:
+        _stats.idleRecycles++;
+        break;
+      case TeardownReason::Dead:
+        _stats.deadSockets++;
+        break;
+      case TeardownReason::LinkDrop:
+        _stats.linkDrops++;
+        break;
+      case TeardownReason::Shutdown:
+        break;
+      }
+
       const int fd = _secureClient->fd();
       (void)_secureClient->socket(); // intentional side-effect: assign -1
 
@@ -86,7 +105,10 @@ namespace HTTP
       _secureClient = nullptr;
     }
 
-    _lastUsedMs = 0;
+    _stats.lastUsedMs = 0;
+    _stats.socketSinceMs = 0;
+    _stats.usesOnSocket = 0;
+    _stats.fd = -1;
     _lastSeenDisconnectSeq = _netLink ? _netLink->disconnectEventSeq() : 0;
   }
 
@@ -105,11 +127,11 @@ namespace HTTP
       debugI("acquireClient: disconnect seq advanced (%lu -> %lu); safe teardown",
              static_cast<unsigned long>(_lastSeenDisconnectSeq),
              static_cast<unsigned long>(curSeq));
-      teardown(/*linkSuspect=*/true);
+      teardown(TeardownReason::LinkDrop);
     }
 
     if (_secureClient && !_secureClient->connected())
-      teardown();
+      teardown(TeardownReason::Dead);
 
     // Recycle stale connections before handing one out.
     recycleIfStale();
@@ -128,6 +150,8 @@ namespace HTTP
       _secureClient->setInsecure();
       _secureClient->setHandshakeTimeout(30);
       _lastSeenDisconnectSeq = _netLink ? _netLink->disconnectEventSeq() : 0;
+      _stats.socketsOpened++;
+      _stats.socketSinceMs = millis();
 
       debugD("Allocated new WiFiClientSecure");
     }
@@ -160,11 +184,14 @@ namespace HTTP
 
   void ConnectionPool::markUsed()
   {
-    _lastUsedMs = millis();
+    _stats.lastUsedMs = millis();
+    _stats.uses++;
+    _stats.usesOnSocket++;
 
     if (!_secureClient)
       return;
     const int fd = _secureClient->fd();
+    _stats.fd = fd;
     if (fd < 0 || fd == _keepaliveFd || !isLwipSocket(fd))
       return;
 
@@ -181,12 +208,12 @@ namespace HTTP
   void ConnectionPool::invalidate()
   {
     debugD("Connection invalidated; tearing down for fresh handshake");
-    teardown();
+    teardown(TeardownReason::Invalidate);
   }
 
   void ConnectionPool::recycleIfStale()
   {
-    if (!_secureClient || _lastUsedMs == 0)
+    if (!_secureClient || _stats.lastUsedMs == 0)
       return;
 
     // Same race protection as acquireClient(): if WiFi dropped since the
@@ -197,15 +224,15 @@ namespace HTTP
       debugI("recycleIfStale: disconnect seq advanced (%lu -> %lu); safe teardown",
              static_cast<unsigned long>(_lastSeenDisconnectSeq),
              static_cast<unsigned long>(curSeq));
-      teardown(/*linkSuspect=*/true);
+      teardown(TeardownReason::LinkDrop);
       return;
     }
 
-    const uint32_t elapsed = millis() - _lastUsedMs;
+    const uint32_t elapsed = millis() - _stats.lastUsedMs;
     if (elapsed >= IDLE_RECYCLE_MS)
     {
       debugI("Recycling idle connection (%lu ms idle)", static_cast<unsigned long>(elapsed));
-      teardown();
+      teardown(TeardownReason::Idle);
     }
   }
 

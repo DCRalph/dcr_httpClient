@@ -27,6 +27,22 @@ namespace HTTP
   class ConnectionPool
   {
   public:
+    // Lifetime counters plus the current socket. Written under the request
+    // mutex; every field is a single word, so a reader without it sees whole values.
+    struct Stats
+    {
+      uint32_t socketsOpened = 0; // WiFiClientSecure allocations
+      uint32_t uses = 0;          // successful requests over the pool
+      uint32_t invalidations = 0; // torn down after a failed request
+      uint32_t idleRecycles = 0;
+      uint32_t deadSockets = 0;   // connected() false when acquired
+      uint32_t linkDrops = 0;     // torn down because the WiFi disconnect seq advanced
+      uint32_t socketSinceMs = 0; // millis() the current socket was allocated, 0 when none
+      uint32_t lastUsedMs = 0;
+      uint32_t usesOnSocket = 0;
+      int fd = -1;
+    };
+
     ConnectionPool() = default;
     ~ConnectionPool();
 
@@ -64,15 +80,27 @@ namespace HTTP
     /// True when the underlying TCP+TLS socket is still connected.
     bool isConnected() const;
 
+    // Lock-free; see Stats.
+    const Stats &stats() const { return _stats; }
+    static constexpr uint32_t idleRecycleMs() { return IDLE_RECYCLE_MS; }
+
   private:
-    // linkSuspect=true: cached fd may already point at another VFS driver
-    // (the lwip socket was freed and the fd recycled). Use the safe-close
-    // path that bypasses close(fd) — see implementation for details.
-    void teardown(bool linkSuspect = false);
+    enum class TeardownReason : uint8_t
+    {
+      Invalidate,
+      Idle,
+      Dead,
+      LinkDrop,
+      Shutdown
+    };
+
+    // LinkDrop/Shutdown: the cached fd may already belong to another VFS driver
+    // (lwip socket freed, fd recycled), so close(fd) is skipped.
+    void teardown(TeardownReason reason);
 
     WiFiClientSecure *_secureClient = nullptr;
     HTTPClient *_http = nullptr;
-    uint32_t _lastUsedMs = 0;
+    Stats _stats;
     bool _initialised = false;
     INetLink *_netLink = nullptr;
 

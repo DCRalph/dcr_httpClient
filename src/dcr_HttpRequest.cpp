@@ -89,6 +89,7 @@ namespace HTTP
   static String s_serverEndpoint;
   static DeviceIdentityProvider s_deviceIdentityProvider;
   static ServerTimeSink s_serverTimeSink;
+  static RequestObserver s_requestObserver;
 
   FreeRtosRaii::Mutex &requestMutex() { return httpRequestMutex(); }
   void setUserAgent(const String &userAgent) { s_userAgent = userAgent; }
@@ -97,6 +98,7 @@ namespace HTTP
   void setServerEndpoint(const String &baseUrl) { s_serverEndpoint = baseUrl; }
   void setDeviceIdentityProvider(DeviceIdentityProvider provider) { s_deviceIdentityProvider = std::move(provider); }
   void setServerTimeSink(ServerTimeSink sink) { s_serverTimeSink = std::move(sink); }
+  void setRequestObserver(RequestObserver observer) { s_requestObserver = std::move(observer); }
 } // namespace HTTP
 
 // ═══════════════════════════════════════════════════════════════════
@@ -307,6 +309,8 @@ namespace
     const char *failureStage = "not-started";
     unsigned long beginMs = 0;
     unsigned long requestMs = 0;
+    bool reused = false;
+    bool retried = false;
   };
 
   struct HeapSnapshot
@@ -663,6 +667,8 @@ namespace
     for (int attempt = 0; attempt < 2; ++attempt)
     {
       const bool reused = HTTP::connectionPool.isConnected();
+      trace.reused = reused;
+      trace.retried = attempt > 0;
       response = executePooledAttempt(method, url, requestFn, timeoutMs,
                                       requestBody, headers, trace);
       if (response.statusCode > 0 || !reused ||
@@ -796,6 +802,27 @@ namespace HTTP
       HttpResponse response;
       const unsigned long startMs = millis();
       const auto allHeaders = buildMergedHeaders(additionalHeaders);
+      WiFiRequestTrace trace;
+      const bool pooled = isPoolableUrl(url);
+
+      const auto notifyObserver = [&](const char *stage)
+      {
+        if (!HTTP::s_requestObserver)
+          return;
+        RequestEvent ev{};
+        ev.method = method;
+        ev.url = url.c_str();
+        ev.statusCode = response.statusCode;
+        ev.durationMs = millis() - startMs;
+        ev.beginMs = trace.beginMs;
+        ev.requestMs = trace.requestMs;
+        ev.stage = stage;
+        ev.pooled = pooled;
+        ev.reused = trace.reused;
+        ev.retried = trace.retried;
+        ev.payloadBytes = response.payload.length();
+        HTTP::s_requestObserver(ev);
+      };
 
       if (!isWiFiAvailable())
       {
@@ -807,10 +834,10 @@ namespace HTTP
         queueFailureLog(method, url, timeoutMs, allHeaders, requestBody,
                         response.statusCode, response.error, "",
                         dur, logErrors);
+        notifyObserver("no-network");
         return response;
       }
 
-      WiFiRequestTrace trace;
       // The request mutex is held only for the duration of the actual
       // request. Diagnostic logging and failure-queue work below run
       // without it, so a slow log path can't stall the next request and
@@ -828,10 +855,11 @@ namespace HTTP
           queueFailureLog(method, url, timeoutMs, allHeaders, requestBody,
                           response.statusCode, response.error, "",
                           dur, logErrors);
+          notifyObserver("mutex");
           return response;
         }
 
-        if (isPoolableUrl(url))
+        if (pooled)
         {
           response = executePooledRequest(method, url, wifiFn, timeoutMs,
                                         requestBody, allHeaders, trace);
@@ -862,6 +890,7 @@ namespace HTTP
         logRequestSuccess(method, url, dur, response.statusCode);
       }
 
+      notifyObserver(trace.failureStage);
       return response;
     }
 

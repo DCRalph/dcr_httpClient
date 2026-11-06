@@ -75,6 +75,25 @@ namespace HTTP
   using ServerTimeSink = std::function<void(uint32_t epoch)>;
   void setServerTimeSink(ServerTimeSink sink);
 
+  /// One record per finished request, delivered on the requesting task after
+  /// the request mutex is released. `url` is only valid during the call.
+  struct RequestEvent
+  {
+    const char *method;
+    const char *url;
+    int statusCode;      // >0 HTTP status, <0 HTTPClient error, -1 if never sent
+    uint32_t durationMs; // whole request, including the mutex wait
+    uint32_t beginMs;    // DNS + connect + TLS; ~0 on a reused socket
+    uint32_t requestMs;  // send + response headers
+    const char *stage;   // completed, http-status, http-begin, http-request, http-closed, no-network, mutex
+    bool pooled;
+    bool reused;  // pooled attempt went out on the existing socket
+    bool retried; // pooled: second attempt on a fresh socket
+    size_t payloadBytes;
+  };
+  using RequestObserver = std::function<void(const RequestEvent &)>;
+  void setRequestObserver(RequestObserver observer);
+
   // ─── Request API ───────────────────────────────────────────
   //
   // Each function blocks until the request completes (or times out).
