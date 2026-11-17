@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstring>
 #include <utility>
 
@@ -311,7 +312,22 @@ namespace
     unsigned long requestMs = 0;
     bool reused = false;
     bool retried = false;
+    // Set when the request failed inside connect(); see captureConnectFailure().
+    bool connectFailed = false;
+    int tlsError = 0;
+    String tlsMessage;
   };
+
+  /// Records the TLS client's error after HTTPClient failed to connect. Call
+  /// before the client is torn down; lastError() survives stop() but not
+  /// deletion.
+  void captureConnectFailure(WiFiClientSecure &client, WiFiRequestTrace &trace)
+  {
+    trace.connectFailed = true;
+    char buf[80] = {};
+    trace.tlsError = client.lastError(buf, sizeof(buf));
+    trace.tlsMessage = buf;
+  }
 
   struct HeapSnapshot
   {
@@ -433,24 +449,154 @@ namespace
       debugV("Response body (%d B):\n%s", resBody.length(), resBody.c_str());
   }
 
-  void queueFailureLog(const char *method, const String &url, int /*timeout*/,
-                       const std::vector<String> & /*headers*/,
-                       const String & /*requestBody*/, int statusCode,
-                       const String &error, const String &responseBody,
-                       unsigned long /*durationMs*/, bool logErrors)
+  constexpr uint32_t CONNECT_PROBE_TIMEOUT_MS = 3000;
+
+  /// Host and port of an http(s) URL; port defaults by scheme.
+  void parseHostPort(const String &url, String &host, uint16_t &port)
+  {
+    const bool https = url.startsWith("https://");
+    const int start = url.indexOf("://") + 3;
+    int end = url.indexOf('/', start);
+    if (end < 0)
+      end = url.length();
+    host = url.substring(start, end);
+    port = https ? 443 : 80;
+    const int colon = host.indexOf(':');
+    if (colon >= 0)
+    {
+      port = static_cast<uint16_t>(host.substring(colon + 1).toInt());
+      host = host.substring(0, colon);
+    }
+  }
+
+  const char *classifyTcpErrno(int err)
+  {
+    switch (err)
+    {
+    case 0:
+      return "tcp-ok";
+    case ECONNREFUSED:
+    case ECONNRESET:
+      return "tcp-refused";
+    case EHOSTUNREACH:
+    case ENETUNREACH:
+      return "tcp-unreachable";
+    case ETIMEDOUT:
+      return "tcp-timeout";
+    default:
+      return "tcp-error";
+    }
+  }
+
+  /// Resolves the host and opens (then closes) a plain TCP connection to it,
+  /// to say which step a failed connect() broke at. Runs without the request
+  /// mutex and uses its own lwip socket; takes up to DNS time plus
+  /// CONNECT_PROBE_TIMEOUT_MS.
+  void probeConnect(const String &url, HTTP::ConnectDiagnosis &diag)
+  {
+    String host;
+    uint16_t port = 0;
+    parseHostPort(url, host, port);
+
+    IPAddress ip;
+    const uint32_t t0 = millis();
+    const bool resolved = WiFi.hostByName(host.c_str(), ip) == 1;
+    diag.dnsMs = millis() - t0;
+    if (!resolved)
+    {
+      diag.probe = "dns-failed";
+      return;
+    }
+    diag.ip = ip.toString();
+
+    const int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0)
+    {
+      diag.tcpErrno = errno;
+      diag.probe = "tcp-error";
+      return;
+    }
+    lwip_fcntl(fd, F_SETFL, lwip_fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = static_cast<uint32_t>(ip);
+
+    const uint32_t t1 = millis();
+    int err = 0;
+    if (lwip_connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
+    {
+      err = errno;
+      if (err == EINPROGRESS)
+      {
+        fd_set wset;
+        FD_ZERO(&wset);
+        FD_SET(fd, &wset);
+        timeval tv{};
+        tv.tv_sec = CONNECT_PROBE_TIMEOUT_MS / 1000;
+        tv.tv_usec = (CONNECT_PROBE_TIMEOUT_MS % 1000) * 1000;
+        const int ready = lwip_select(fd + 1, nullptr, &wset, nullptr, &tv);
+        if (ready == 0)
+          err = ETIMEDOUT;
+        else if (ready < 0)
+          err = errno;
+        else
+        {
+          socklen_t len = sizeof(err);
+          if (lwip_getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0)
+            err = errno;
+        }
+      }
+    }
+    diag.tcpMs = millis() - t1;
+    diag.tcpErrno = err;
+    diag.probe = classifyTcpErrno(err);
+    lwip_close(fd);
+  }
+
+  /// Hands a failure to the application's FailureLogger, deduplicated. When
+  /// the request failed inside connect(), probes DNS and TCP first, so the
+  /// probe runs at most as often as failures are logged.
+  void queueFailureLog(const char *method, const String &url, int timeoutMs,
+                       const HTTP::HttpResponse &response, uint32_t durationMs,
+                       const char *stage, bool pooled,
+                       const WiFiRequestTrace &trace, bool logErrors)
   {
     if (!logErrors)
       return;
     if (!HTTP::s_failureLogger)
       return;
 
-    const uint32_t nowMs = millis();
-    const String sig = buildFailureSignature(method, url, statusCode, error);
-    if (!shouldLogFailure(sig, nowMs))
+    const String sig = buildFailureSignature(method, url, response.statusCode,
+                                             response.error);
+    if (!shouldLogFailure(sig, millis()))
       return;
 
-    HTTP::s_failureLogger(statusCode, String(method), url, responseBody,
-                          LoggerInternal::GetLatestLogs());
+    HTTP::ConnectDiagnosis diag;
+    if (trace.connectFailed)
+    {
+      diag.ran = true;
+      diag.tlsError = trace.tlsError;
+      diag.tlsMessage = trace.tlsMessage;
+      probeConnect(url, diag);
+    }
+
+    const HTTP::FailureInfo info{
+        .statusCode = response.statusCode,
+        .method = method,
+        .url = url,
+        .error = response.error,
+        .response = response.payload,
+        .timeoutMs = timeoutMs,
+        .durationMs = durationMs,
+        .stage = stage,
+        .pooled = pooled,
+        .reused = trace.reused,
+        .retried = trace.retried,
+        .connect = diag,
+    };
+    HTTP::s_failureLogger(info, LoggerInternal::GetLatestLogs());
   }
 
   // WiFi.status() stays WL_CONNECTED after an AUTH_EXPIRE deauth; NetLink
@@ -613,6 +759,8 @@ namespace
     {
       response.error = "HTTP error code: " + String(response.statusCode) +
                        " (" + HTTPClient::errorToString(response.statusCode) + ")";
+      if (response.statusCode == HTTPC_ERROR_CONNECTION_REFUSED)
+        captureConnectFailure(*client, trace);
       // Negative status means transport failure; tear down so next
       // request gets a fresh TLS handshake.
       HTTP::connectionPool.invalidate();
@@ -753,6 +901,13 @@ namespace
     {
       response.error = "HTTP error code: " + String(response.statusCode) +
                        " (" + HTTPClient::errorToString(response.statusCode) + ")";
+      if (response.statusCode == HTTPC_ERROR_CONNECTION_REFUSED)
+      {
+        if (https)
+          captureConnectFailure(httpsClient, trace);
+        else
+          trace.connectFailed = true; // plain TCP: the probe alone explains it
+      }
     }
 
     const String resHeaders = (response.statusCode > 0)
@@ -831,9 +986,8 @@ namespace HTTP
         if (logErrors)
           logRequestError(method, url, dur, -1, response.error,
                           requestBody, "");
-        queueFailureLog(method, url, timeoutMs, allHeaders, requestBody,
-                        response.statusCode, response.error, "",
-                        dur, logErrors);
+        queueFailureLog(method, url, timeoutMs, response, dur, "no-network",
+                        pooled, trace, logErrors);
         notifyObserver("no-network");
         return response;
       }
@@ -852,9 +1006,8 @@ namespace HTTP
           if (logErrors)
             logRequestError(method, url, dur, -1, response.error,
                             requestBody, "");
-          queueFailureLog(method, url, timeoutMs, allHeaders, requestBody,
-                          response.statusCode, response.error, "",
-                          dur, logErrors);
+          queueFailureLog(method, url, timeoutMs, response, dur, "mutex",
+                          pooled, trace, logErrors);
           notifyObserver("mutex");
           return response;
         }
@@ -881,9 +1034,8 @@ namespace HTTP
           logRequestError(method, url, dur, response.statusCode,
                           response.error, requestBody, response.payload,
                           &trace);
-        queueFailureLog(method, url, timeoutMs, allHeaders, requestBody,
-                        response.statusCode, response.error,
-                        response.payload, dur, logErrors);
+        queueFailureLog(method, url, timeoutMs, response, dur,
+                        trace.failureStage, pooled, trace, logErrors);
       }
       else
       {

@@ -50,12 +50,50 @@ namespace HTTP
   void setUserAgent(const String &userAgent);
   String userAgent();
 
+  /// Which step of a fresh connection failed. HTTPClient reports every
+  /// connect() failure as -1 "connection refused", whether DNS, TCP or the TLS
+  /// handshake broke, so after such a failure the library records the TLS
+  /// client's own error and probes DNS and TCP on a socket of its own.
+  struct ConnectDiagnosis
+  {
+    bool ran = false;      // false unless the request failed inside connect()
+    int tlsError = 0;      // WiFiClientSecure::lastError(): an mbedTLS code (< -1) when
+                           // the handshake failed, -1 when the core's TCP connect did
+    String tlsMessage;     // mbedtls_strerror() text for tlsError
+    // Probe, run after the failure: dns-failed, tcp-refused, tcp-unreachable,
+    // tcp-timeout, tcp-error or tcp-ok. tcp-ok with a TLS code means the TLS
+    // handshake failed; tcp-ok without one means the link recovered before
+    // the probe ran.
+    const char *probe = "";
+    uint32_t dnsMs = 0;
+    String ip;             // resolved address, empty when DNS failed
+    uint32_t tcpMs = 0;
+    int tcpErrno = 0;      // SO_ERROR / errno from the probe's connect, 0 on success
+  };
+
+  /// Everything known about one failed request. References are only valid
+  /// during the FailureLogger call.
+  struct FailureInfo
+  {
+    int statusCode;      // >0 HTTP status, <0 HTTPClient error, -1 if never sent
+    const char *method;
+    const String &url;
+    const String &error;
+    const String &response;
+    int timeoutMs;
+    uint32_t durationMs; // whole request, including the mutex wait
+    const char *stage;   // as RequestEvent::stage
+    bool pooled;
+    bool reused;
+    bool retried;
+    const ConnectDiagnosis &connect;
+  };
+
   /// Register an application sink that receives failure information for
-  /// dedup'd remote logging (e.g. ServerLogService::log). Pass nullptr to clear.
-  using FailureLogger = std::function<void(int statusCode,
-                                           const String &method,
-                                           const String &url,
-                                           const String &response,
+  /// dedup'd remote logging (e.g. ServerLogService::log). Called on the
+  /// requesting task after the request mutex is released, at most once a
+  /// minute per method, endpoint and failure category. Pass nullptr to clear.
+  using FailureLogger = std::function<void(const FailureInfo &info,
                                            const std::vector<String> &latestLogs)>;
   void setFailureLogger(FailureLogger logger);
 
