@@ -371,26 +371,17 @@ namespace
 
     HTTP::s_lastLowInternalHeapRecoveryMs = nowMs;
 
-    debugW("Internal heap largest block low (%u B); freeing pool TLS context "
-           "and cycling WiFi",
+    debugW("Internal heap largest block low (%u B); freeing pool TLS context",
            internalLargestBlock);
 
-    // The connection pool's WiFiClientSecure owns a mbedTLS context that
-    // lives in DRAM and is typically the largest single internal-heap
-    // consumer. Freeing it is the most direct way to recover headroom;
-    // cycling WiFi alone leaves the TLS state allocated. The pool
-    // contract requires HTTP::httpRequestMutex(), so we take it here. If we
-    // cannot acquire it within the short wait, skip the invalidate — the
-    // next failed request will tear the connection down on its own.
+    // WiFi stays up: a reconnect frees little and drops every other client.
+    // Pool access needs httpRequestMutex(); if it is busy, the next failed
+    // request tears the connection down on its own.
     if (auto requestLock = FreeRtosRaii::tryLock(HTTP::httpRequestMutex(),
                                                  MUTEX_WAIT_DEFAULT))
       HTTP::connectionPool.invalidate();
     else
       debugW("Skipping pool invalidate during recovery; request mutex busy");
-
-    // Use the silent reconnect path so the user's current screen is not
-    // covered by "WiFi Disconnect / Please Wait" popups during recovery.
-    netLink.requestSilentReconnect();
   }
 
   void logRequestError(const char *method, const String &url,
